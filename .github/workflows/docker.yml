@@ -5,7 +5,22 @@ on:
     branches: [main]
   release:
     types: [published]
+
+  # Rebuilt on a timer as well as on a change.
+  #
+  # Nothing in the Dockerfile changes when Ubuntu ships a security update, when
+  # a new Actions runner is released, or when the kernel is patched. A node
+  # pulls this image only when its tag moves, so with no rebuild it keeps
+  # booting the packages of the day this file last changed.
+  schedule:
+    - cron: '0 4 * * 1'
+
   workflow_dispatch:
+    inputs:
+      no_cache:
+        description: Ignore the layer cache, to pick up every upstream update
+        type: boolean
+        default: false
 
 env:
   REGISTRY: ghcr.io
@@ -14,12 +29,23 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # The image carries a kernel, two runners, a Docker daemon and the
+    # toolchains, and it is built for two architectures.
+    timeout-minutes: 180
     permissions:
       contents: read
       packages: write
 
     steps:
       - uses: actions/checkout@v5
+
+      # The hosted runner has about 14 GB free, and this image does not fit
+      # beside what the image of the runner itself ships.
+      - name: Make room on the builder
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo rm -rf /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          df -h /
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
@@ -41,6 +67,9 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha,format=short
             type=raw,value=latest,enable={{is_default_branch}}
+            # A scheduled build is what picks up upstream updates, so it gets a
+            # tag that says which day's packages a node is running.
+            type=schedule,pattern={{date 'YYYYMMDD'}}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -50,5 +79,9 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # A scheduled rebuild exists to take upstream updates. Reading the
+          # cache would return the same layers and publish the same packages
+          # under a new tag.
+          no-cache: ${{ github.event_name == 'schedule' || inputs.no_cache == true }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
