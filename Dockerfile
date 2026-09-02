@@ -10,7 +10,7 @@
 FROM ubuntu:26.04
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG RUNNER_VERSION=2.328.0
+ARG RUNNER_VERSION=2.337.0
 ARG GITLAB_RUNNER_VERSION=v17.11.0
 
 # amd64 or arm64. The runner downloads and the tool cache spell the same
