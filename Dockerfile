@@ -17,7 +17,13 @@ ARG GITLAB_RUNNER_VERSION=v17.11.0
 # architectures differently, so both spellings appear below.
 ARG TARGETARCH
 
-SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+# -e as well as pipefail.
+#
+# Without it a command that fails inside a loop or a group does not stop the
+# build. The loop over the Node versions is the case that matters: the first
+# download could fail, the second succeed, and the image would ship with one of
+# the two toolchains and no error anywhere.
+SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
 
 # The init, the kernel, and the base tools.
 #
@@ -75,6 +81,30 @@ RUN install -m 0755 -d /etc/apt/keyrings \
         docker-compose-plugin \
  && rm -rf /var/lib/apt/lists/*
 
+# What the Actions runner needs to run. It is a .NET program.
+#
+# Not `./bin/installdependencies.sh` from the tarball. That script holds a list
+# of package names from older distributions and tries each one until it finds
+# one that exists. This release ships none of them, so the script spends minutes
+# failing and then installs nothing, and the runner does not start.
+#
+# The names are resolved from the archive of this release instead, so the next
+# one needs no change here.
+RUN apt-get update \
+ && icu="$(apt-cache search --names-only '^libicu[0-9]+$' | sort -V | tail -n1 | cut -d' ' -f1)" \
+ && ssl="$(apt-cache search --names-only '^libssl[0-9]+(t64)?$' | sort -V | tail -n1 | cut -d' ' -f1)" \
+ && if [ -z "$icu" ] || [ -z "$ssl" ]; then \
+        echo "this release ships no libicu or no libssl under a name we know: icu='$icu' ssl='$ssl'" >&2 ; \
+        exit 1 ; \
+    fi \
+ && echo "runner dependencies: $icu $ssl" \
+ && apt-get install -y --no-install-recommends \
+        "$icu" \
+        "$ssl" \
+        libkrb5-3 \
+        zlib1g \
+ && rm -rf /var/lib/apt/lists/*
+
 # The GitHub Actions runner, where the config disk of a machine expects it.
 RUN useradd -m -s /bin/bash runner \
  && usermod -aG docker runner \
@@ -88,9 +118,7 @@ RUN useradd -m -s /bin/bash runner \
         "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${runner_arch}-${RUNNER_VERSION}.tar.gz" \
  && tar -xzf runner.tar.gz \
  && rm runner.tar.gz \
- && ./bin/installdependencies.sh \
- && chown -R runner:runner /home/runner \
- && rm -rf /var/lib/apt/lists/*
+ && chown -R runner:runner /home/runner
 
 # gitlab-runner, for a machine that serves a GitLab repository.
 #
@@ -152,13 +180,18 @@ RUN apt-get update \
 # runs the job. Docker is started by that unit, after the cache disk is mounted
 # over its image store — started here it would make a store on the root disk and
 # the job would run cold.
+# Docker is disabled, not masked. The init of the guest starts it by hand once
+# the cache disk is mounted over its image store, and a masked unit cannot be
+# started at all.
+#
+# The rest are masked, because nothing should ever start them.
 RUN systemctl mask \
         getty@tty1.service \
         serial-getty@ttyS0.service \
         systemd-resolved.service \
         apt-daily.timer \
         apt-daily-upgrade.timer \
- && systemctl disable docker.service docker.socket \
+ && systemctl disable docker.service docker.socket || true \
  && rm -f /etc/machine-id \
  && rm -rf /var/cache/apt/archives/*.deb
 
