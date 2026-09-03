@@ -28,7 +28,7 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: makecore-max
     # The image carries a kernel, two runners, a Docker daemon and the
     # toolchains, and it is built for two architectures.
     timeout-minutes: 180

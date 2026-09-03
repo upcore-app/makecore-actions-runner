@@ -141,13 +141,14 @@ RUN case "${TARGETARCH}" in \
 # these versions then downloads nothing.
 ARG NODE_LTS_A=22.20.0
 ARG NODE_LTS_B=20.19.5
+ARG NODE_LTS_C=24.19.0
 
 RUN case "${TARGETARCH}" in \
         amd64) node_arch=x64 ;; \
         arm64) node_arch=arm64 ;; \
         *) echo "unsupported architecture ${TARGETARCH}" >&2; exit 1 ;; \
     esac \
- && for version in "${NODE_LTS_A}" "${NODE_LTS_B}"; do \
+ && for version in "${NODE_LTS_A}" "${NODE_LTS_B}" "${NODE_LTS_C}"; do \
         target="/opt/hostedtoolcache/node/${version}/${node_arch}" ; \
         mkdir -p "${target}" ; \
         curl -fsSL "https://nodejs.org/dist/v${version}/node-v${version}-linux-${node_arch}.tar.xz" \
@@ -173,6 +174,554 @@ RUN apt-get update \
         openjdk-21-jdk-headless \
         openjdk-17-jdk-headless \
  && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# Parity with GitHub's `ubuntu-24.04` runner image.
+#
+# Everything below exists because a workflow written against `ubuntu-latest`
+# expects to find it already there. The source of truth is
+# `images/ubuntu/toolsets/toolset-2404.json` in `actions/runner-images`; the
+# lists here are that file, transcribed. When GitHub moves a version, this is
+# the file that has to move with it.
+#
+# Two deliberate differences. This is Ubuntu 26.04 and GitHub's is 24.04, so a
+# package name that changed between the two is resolved from the archive rather
+# than pinned. And nothing here is Azure-specific: GitHub's image carries agents
+# and telemetry for the fleet it runs on, which a machine of ours has no use for.
+#
+# Nothing is installed with `|| true`. A name that moved must fail the build and
+# be fixed here, not disappear into an image that ships a hole where a toolchain
+# was supposed to be.
+# ---------------------------------------------------------------------------
+
+# The apt packages, as three lists: `vital`, `common` and `cmd` in the toolset.
+#
+# --no-install-recommends throughout, which is what GitHub does. A recommends
+# pulled in here is a package no workflow asked for on every root disk.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        bzip2 curl g++ gcc make jq tar unzip wget \
+        autoconf automake dbus dnsutils dpkg dpkg-dev fakeroot \
+        fonts-noto-color-emoji gnupg2 iproute2 iputils-ping libyaml-dev \
+        libtool libssl-dev libicu-dev libsqlite3-dev locales mercurial \
+        openssh-client p7zip-rar pkg-config python-is-python3 rpm texinfo \
+        tk tree tzdata upx xvfb xz-utils zsync \
+        acl aria2 binutils bison brotli libnss3-tools coreutils file \
+        findutils flex ftp haveged lz4 m4 mediainfo netcat-openbsd net-tools \
+        p7zip-full parallel patchelf pigz pollinate rsync shellcheck \
+        sphinxsearch sqlite3 ssh sshpass sudo systemd-coredump swig \
+        telnet time zip \
+ && locale-gen en_US.UTF-8 \
+ && rm -rf /var/lib/apt/lists/*
+
+# The compiler matrix. GitHub ships three of each, not one.
+#
+# `gcc`/`g++` from build-essential above is whatever this release defaults to;
+# these are the versioned binaries a workflow names explicitly.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        gcc-12 g++-12 gfortran-12 \
+        gcc-13 g++-13 gfortran-13 \
+        gcc-14 g++-14 gfortran-14 \
+        clang-16 clang-17 clang-18 \
+        clang-format-16 clang-format-17 clang-format-18 \
+        clang-tidy-16 clang-tidy-17 clang-tidy-18 \
+        lld-18 llvm-18 \
+ && update-alternatives --install /usr/bin/clang clang /usr/bin/clang-18 100 \
+ && update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-18 100 \
+ && update-alternatives --install /usr/bin/clang-format clang-format /usr/bin/clang-format-18 100 \
+ && update-alternatives --install /usr/bin/clang-tidy clang-tidy /usr/bin/clang-tidy-18 100 \
+ && rm -rf /var/lib/apt/lists/*
+
+# The global npm packages of the toolset's `node_modules`, plus node-gyp.
+#
+# node-gyp is the one addition to GitHub's list, and it is here because of how
+# a native module resolves its compiler. npm puts its own bundled copy on PATH
+# for the lifecycle scripts it runs, so `node-gyp` resolves under npm without
+# ever being installed; bun runs those same scripts with no such PATH, so a
+# package whose install script falls back from a prebuild to `node-gyp rebuild`
+# dies with 127. Installing it globally makes the fallback path work under both.
+#
+# Into every cached Node, not only the default. `setup-node` puts the version a
+# workflow pins at the front of PATH, so a global installed against 22 alone is
+# not on PATH for a job that asked for 24.
+RUN for prefix in /opt/hostedtoolcache/node/*/*/ ; do \
+        [ -x "${prefix}bin/npm" ] || continue ; \
+        echo "global modules into ${prefix}" ; \
+        "${prefix}bin/npm" install -g --prefix "${prefix}" \
+            node-gyp grunt gulp n parcel typescript newman \
+            webpack webpack-cli lerna yarn ; \
+    done
+
+# Python, in the tool cache layout `setup-python` reads.
+#
+# The versions come from `actions/python-versions`, which is where the action
+# itself would download them from. Building them here rather than letting each
+# job fetch one is the whole point of a cache.
+ARG PYTHON_VERSIONS="3.10 3.11 3.12 3.13 3.14"
+
+RUN case "${TARGETARCH}" in \
+        amd64) tc_arch=x64 ;; \
+        arm64) tc_arch=arm64 ;; \
+        *) echo "unsupported architecture ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+ && manifest="$(curl -fsSL https://raw.githubusercontent.com/actions/python-versions/main/versions-manifest.json)" \
+ && for series in ${PYTHON_VERSIONS}; do \
+        url="$(echo "${manifest}" | jq -r --arg s "${series}." --arg a "${tc_arch}" '[.[] | select(.version | startswith($s)) | select(.stable)] | first | .files[] | select(.platform == "linux" and .arch == $a) | .download_url')" ; \
+        if [ -z "${url}" ] || [ "${url}" = "null" ]; then \
+            echo "no python ${series} for linux/${tc_arch} in the manifest" >&2 ; exit 1 ; \
+        fi ; \
+        tmp="$(mktemp -d)" ; \
+        curl -fsSL "${url}" | tar -xz -C "${tmp}" ; \
+        "${tmp}/setup.sh" ; \
+        rm -rf "${tmp}" ; \
+    done \
+ && ln -sf "/opt/hostedtoolcache/Python/$(ls /opt/hostedtoolcache/Python | sort -V | tail -n1)/${tc_arch}/bin/python3" /usr/local/bin/python3
+
+# pipx, and the two packages the toolset installs with it.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3-pip pipx \
+ && rm -rf /var/lib/apt/lists/* \
+ && PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin pipx install yamllint \
+ && PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin pipx install ansible-core
+
+# Go, in the tool cache as well as at /usr/local/go.
+#
+# The symlinks from the layer above stay: a job that runs `go` without asking
+# `setup-go` for a version gets the default, as it does on GitHub.
+ARG GO_VERSIONS="1.24 1.25 1.26"
+
+RUN case "${TARGETARCH}" in \
+        amd64) tc_arch=x64 ; dl_arch=amd64 ;; \
+        arm64) tc_arch=arm64 ; dl_arch=arm64 ;; \
+        *) echo "unsupported architecture ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+ && manifest="$(curl -fsSL https://raw.githubusercontent.com/actions/go-versions/main/versions-manifest.json)" \
+ && for series in ${GO_VERSIONS}; do \
+        version="$(echo "${manifest}" | jq -r --arg s "${series}." \
+            '[.[] | select(.version | startswith($s)) | select(.stable)] | first | .version')" ; \
+        if [ -z "${version}" ] || [ "${version}" = "null" ]; then \
+            echo "no stable go ${series} in the manifest" >&2 ; exit 1 ; \
+        fi ; \
+        target="/opt/hostedtoolcache/go/${version}/${tc_arch}" ; \
+        mkdir -p "${target}" ; \
+        curl -fsSL "https://go.dev/dl/go${version}.linux-${dl_arch}.tar.gz" \
+            | tar -xz --strip-components=1 -C "${target}" ; \
+        touch "/opt/hostedtoolcache/go/${version}/${tc_arch}.complete" ; \
+    done
+
+# Ruby, in the tool cache, from the builds `setup-ruby` uses.
+#
+# These are built for a specific Ubuntu release and 26.04 has none of its own
+# yet, so the 24.04 builds are what is fetched. They are dynamically linked
+# against libssl and libyaml, both installed above.
+ARG RUBY_VERSIONS="3.2 3.3 3.4"
+
+RUN case "${TARGETARCH}" in \
+        amd64) tc_arch=x64 ;; \
+        arm64) tc_arch=arm64 ;; \
+        *) echo "unsupported architecture ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+ && releases="$(curl -fsSL https://api.github.com/repos/ruby/ruby-builder/releases?per_page=100)" \
+ && for series in ${RUBY_VERSIONS}; do \
+        url="$(echo "${releases}" | jq -r --arg s "ruby-${series}." '[.[].assets[] | select(.name | startswith($s)) | select(.name | contains("ubuntu-24.04"))] | sort_by(.name) | last | .browser_download_url')" ; \
+        if [ -z "${url}" ] || [ "${url}" = "null" ]; then \
+            echo "no ruby ${series} build for ubuntu-24.04" >&2 ; exit 1 ; \
+        fi ; \
+        version="$(basename "${url}" | sed -E 's/^ruby-([0-9.]+)-.*/\1/')" ; \
+        target="/opt/hostedtoolcache/Ruby/${version}/${tc_arch}" ; \
+        mkdir -p "${target}" ; \
+        curl -fsSL "${url}" | tar -xz --strip-components=1 -C "${target}" ; \
+        touch "/opt/hostedtoolcache/Ruby/${version}/${tc_arch}.complete" ; \
+    done \
+ && default="/opt/hostedtoolcache/Ruby/$(ls /opt/hostedtoolcache/Ruby | sort -V | tail -n1)/${tc_arch}" \
+ && ln -sf "${default}/bin/ruby" /usr/local/bin/ruby \
+ && ln -sf "${default}/bin/gem" /usr/local/bin/gem \
+ && "${default}/bin/gem" install --no-document multi_json fastlane
+
+# Java. Five JDKs and the JAVA_HOME_<version>_<arch> variables that name them.
+#
+# From Adoptium, not from apt. This release archives no openjdk-8 at all, and
+# Temurin is where GitHub takes these from anyway, so one source serves all five
+# and the set does not thin out as the distribution drops old ones.
+ARG JAVA_VERSIONS="8 11 17 21 25"
+ARG JAVA_DEFAULT=17
+
+RUN case "${TARGETARCH}" in \
+        amd64) jdk_arch=x64 ;; \
+        arm64) jdk_arch=aarch64 ;; \
+        *) echo "unsupported architecture ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+ && case "${TARGETARCH}" in amd64) home_arch=X64 ;; arm64) home_arch=ARM64 ;; esac \
+ && mkdir -p /usr/lib/jvm \
+ && for version in ${JAVA_VERSIONS}; do \
+        target="/usr/lib/jvm/temurin-${version}" ; \
+        mkdir -p "${target}" ; \
+        curl -fsSL "https://api.adoptium.net/v3/binary/latest/${version}/ga/linux/${jdk_arch}/jdk/hotspot/normal/eclipse" \
+            | tar -xz --strip-components=1 -C "${target}" ; \
+        echo "JAVA_HOME_${version}_${home_arch}=${target}" >> /etc/environment ; \
+    done \
+ && echo "JAVA_HOME=/usr/lib/jvm/temurin-${JAVA_DEFAULT}" >> /etc/environment \
+ && update-alternatives --install /usr/bin/java java "/usr/lib/jvm/temurin-${JAVA_DEFAULT}/bin/java" 100 \
+ && update-alternatives --install /usr/bin/javac javac "/usr/lib/jvm/temurin-${JAVA_DEFAULT}/bin/javac" 100
+
+ENV JAVA_HOME=/usr/lib/jvm/temurin-17
+
+# Maven, Gradle and Ant, which the toolset carries beside the JDKs.
+ARG MAVEN_VERSION=3.9.16
+ARG GRADLE_VERSION=9.7.1
+
+RUN curl -fsSL "https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz" \
+        | tar -xz -C /opt \
+ && ln -sf "/opt/apache-maven-${MAVEN_VERSION}/bin/mvn" /usr/local/bin/mvn \
+ && curl -fsSL -o /tmp/gradle.zip "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" \
+ && unzip -q /tmp/gradle.zip -d /opt \
+ && rm /tmp/gradle.zip \
+ && ln -sf "/opt/gradle-${GRADLE_VERSION}/bin/gradle" /usr/local/bin/gradle \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends ant \
+ && rm -rf /var/lib/apt/lists/*
+
+# Microsoft's archive: .NET and PowerShell.
+#
+# The feed is named for a release, and 26.04 may not have one on the day this
+# builds. The newest feed that exists is resolved rather than hard-coded, so
+# this layer does not have to be edited the moment Microsoft publishes one.
+RUN . /etc/os-release \
+ && for candidate in "${VERSION_ID}" 25.10 25.04 24.04; do \
+        if curl -fsIL -o /dev/null "https://packages.microsoft.com/config/ubuntu/${candidate}/packages-microsoft-prod.deb"; then \
+            feed="${candidate}" ; break ; \
+        fi ; \
+    done \
+ && if [ -z "${feed:-}" ]; then echo "no microsoft feed for this release" >&2; exit 1; fi \
+ && echo "microsoft feed: ubuntu/${feed}" \
+ && curl -fsSL -o /tmp/ms-prod.deb "https://packages.microsoft.com/config/ubuntu/${feed}/packages-microsoft-prod.deb" \
+ && dpkg -i /tmp/ms-prod.deb \
+ && rm /tmp/ms-prod.deb \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+        dotnet-sdk-8.0 dotnet-sdk-9.0 \
+        powershell \
+ && rm -rf /var/lib/apt/lists/*
+
+# .NET 10, which the archive above does not carry yet, from the install script.
+RUN curl -fsSL -o /tmp/dotnet-install.sh https://dot.net/v1/dotnet-install.sh \
+ && chmod +x /tmp/dotnet-install.sh \
+ && /tmp/dotnet-install.sh --channel 10.0 --install-dir /usr/share/dotnet --no-path \
+ && rm /tmp/dotnet-install.sh \
+ && ln -sf /usr/share/dotnet/dotnet /usr/local/bin/dotnet \
+ && DOTNET_CLI_TELEMETRY_OPTOUT=1 dotnet tool install --tool-path /usr/local/bin nbgv
+
+ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 \
+    DOTNET_NOLOGO=1 \
+    DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
+
+# The PowerShell modules of the toolset.
+#
+# Az is several hundred megabytes and the slowest thing in this file to install.
+RUN pwsh -NoProfile -Command \
+        "Set-PSRepository -Name PSGallery -InstallationPolicy Trusted; \
+         Install-Module -Name Az -RequiredVersion 15.6.1 -Scope AllUsers -Force; \
+         Install-Module -Name Microsoft.Graph -Scope AllUsers -Force; \
+         Install-Module -Name Pester -RequiredVersion 5.9.0 -Scope AllUsers -Force -SkipPublisherCheck; \
+         Install-Module -Name PSScriptAnalyzer -Scope AllUsers -Force"
+
+# Rust, for the runner user as well as root: rustup installs per-user, and a
+# job runs as `runner`.
+ENV RUSTUP_HOME=/usr/share/rust/.rustup \
+    CARGO_HOME=/usr/share/rust/.cargo \
+    PATH=/usr/share/rust/.cargo/bin:$PATH
+
+RUN curl -fsSL https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path \
+ && /usr/share/rust/.cargo/bin/rustup component add rustfmt clippy \
+ && chmod -R a+rwX /usr/share/rust
+
+# Haskell: GHC, cabal and stack, through ghcup.
+ENV GHCUP_INSTALL_BASE_PREFIX=/usr/local \
+    PATH=/usr/local/.ghcup/bin:$PATH
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libnuma-dev libgmp-dev \
+ && rm -rf /var/lib/apt/lists/* \
+ && curl -fsSL -o /tmp/ghcup https://downloads.haskell.org/~ghcup/x86_64-linux-ghcup \
+ && chmod +x /tmp/ghcup \
+ && BOOTSTRAP_HASKELL_NONINTERACTIVE=1 \
+    BOOTSTRAP_HASKELL_INSTALL_STACK=1 \
+    BOOTSTRAP_HASKELL_ADJUST_BASHRC=0 \
+    /tmp/ghcup install ghc --set latest \
+ && /tmp/ghcup install cabal latest \
+ && /tmp/ghcup install stack latest \
+ && install -m 0755 /tmp/ghcup /usr/local/bin/ghcup \
+ && rm /tmp/ghcup \
+ && chmod -R a+rX /usr/local/.ghcup
+
+# PHP, from ondrej's archive.
+#
+# 26.04 ships a newer PHP than GitHub's image has, and a workflow pinned to 8.3
+# has to find 8.3. The archive is the only place that still carries it.
+ARG PHP_VERSION=8.3
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends software-properties-common \
+ && add-apt-repository -y ppa:ondrej/php \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+        "php${PHP_VERSION}" "php${PHP_VERSION}-cli" "php${PHP_VERSION}-common" \
+        "php${PHP_VERSION}-curl" "php${PHP_VERSION}-mbstring" "php${PHP_VERSION}-xml" \
+        "php${PHP_VERSION}-zip" "php${PHP_VERSION}-bcmath" "php${PHP_VERSION}-intl" \
+        "php${PHP_VERSION}-sqlite3" "php${PHP_VERSION}-mysql" "php${PHP_VERSION}-pgsql" \
+        "php${PHP_VERSION}-xdebug" "php${PHP_VERSION}-pcov" \
+ && rm -rf /var/lib/apt/lists/* \
+ && curl -fsSL https://getcomposer.org/installer -o /tmp/composer-setup.php \
+ && php /tmp/composer-setup.php --install-dir=/usr/local/bin --filename=composer \
+ && rm /tmp/composer-setup.php \
+ && curl -fsSL -o /usr/local/bin/phpunit https://phar.phpunit.de/phpunit-8.phar \
+ && chmod 0755 /usr/local/bin/phpunit
+
+# Kotlin, Julia and Swift.
+ARG KOTLIN_VERSION=2.4.10
+ARG JULIA_VERSION=1.12.7
+ARG SWIFT_VERSION=6.3.3
+
+RUN curl -fsSL -o /tmp/kotlin.zip \
+        "https://github.com/JetBrains/kotlin/releases/download/v${KOTLIN_VERSION}/kotlin-compiler-${KOTLIN_VERSION}.zip" \
+ && unzip -q /tmp/kotlin.zip -d /usr/local \
+ && rm /tmp/kotlin.zip \
+ && for bin in /usr/local/kotlinc/bin/*; do ln -sf "${bin}" "/usr/local/bin/$(basename "${bin}")"; done \
+ && case "${TARGETARCH}" in amd64) jl_arch=x64 ; jl_dir=x86_64 ;; arm64) jl_arch=aarch64 ; jl_dir=aarch64 ;; esac \
+ && curl -fsSL "https://julialang-s3.julialang.org/bin/linux/${jl_arch}/${JULIA_VERSION%.*}/julia-${JULIA_VERSION}-linux-${jl_dir}.tar.gz" \
+        | tar -xz -C /opt \
+ && ln -sf "/opt/julia-${JULIA_VERSION}/bin/julia" /usr/local/bin/julia
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        binutils-gold libcurl4-openssl-dev libedit2 libncurses-dev \
+        libpython3-dev libxml2-dev libz3-dev \
+ && rm -rf /var/lib/apt/lists/* \
+ && . /etc/os-release \
+ && for candidate in "${VERSION_ID//./}" 2404 2204; do \
+        url="https://download.swift.org/swift-${SWIFT_VERSION}-release/ubuntu${candidate}/swift-${SWIFT_VERSION}-RELEASE/swift-${SWIFT_VERSION}-RELEASE-ubuntu${candidate}.tar.gz" ; \
+        if curl -fsIL -o /dev/null "${url}"; then swift_url="${url}" ; break ; fi ; \
+    done \
+ && if [ -z "${swift_url:-}" ]; then echo "no swift ${SWIFT_VERSION} build for this release" >&2; exit 1; fi \
+ && echo "swift: ${swift_url}" \
+ && mkdir -p /opt/swift \
+ && curl -fsSL "${swift_url}" | tar -xz --strip-components=1 -C /opt/swift \
+ && ln -sf /opt/swift/usr/bin/swift /usr/local/bin/swift \
+ && ln -sf /opt/swift/usr/bin/swiftc /usr/local/bin/swiftc
+
+# The build tools: cmake, ninja, bazel and vcpkg.
+#
+# cmake is pinned where GitHub pins it. Their note says 4.0 breaks projects that
+# still declare a 3.x minimum, and a runner is the wrong place to find that out.
+ARG CMAKE_VERSION=3.31.6
+
+RUN case "${TARGETARCH}" in amd64) cm_arch=x86_64 ;; arm64) cm_arch=aarch64 ;; esac \
+ && curl -fsSL "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-${cm_arch}.tar.gz" \
+        | tar -xz --strip-components=1 -C /usr/local \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends ninja-build \
+ && rm -rf /var/lib/apt/lists/* \
+ && case "${TARGETARCH}" in amd64) bz_arch=amd64 ;; arm64) bz_arch=arm64 ;; esac \
+ && curl -fsSL -o /usr/local/bin/bazelisk \
+        "https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-${bz_arch}" \
+ && chmod 0755 /usr/local/bin/bazelisk \
+ && ln -sf /usr/local/bin/bazelisk /usr/local/bin/bazel \
+ && git clone --depth 1 https://github.com/microsoft/vcpkg /usr/local/share/vcpkg \
+ && /usr/local/share/vcpkg/bootstrap-vcpkg.sh -disableMetrics \
+ && ln -sf /usr/local/share/vcpkg/vcpkg /usr/local/bin/vcpkg \
+ && chmod -R a+rwX /usr/local/share/vcpkg
+
+ENV VCPKG_INSTALLATION_ROOT=/usr/local/share/vcpkg
+
+# Miniconda and Homebrew, where GitHub's CONDA and brew notes say they are.
+#
+# Homebrew is installed but deliberately left off PATH, as on GitHub: a job that
+# wants it runs `eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"`.
+RUN curl -fsSL -o /tmp/miniconda.sh \
+        "https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-$(uname -m).sh" \
+ && bash /tmp/miniconda.sh -b -p /usr/share/miniconda \
+ && rm /tmp/miniconda.sh \
+ && chmod -R a+rX /usr/share/miniconda
+
+ENV CONDA=/usr/share/miniconda
+
+RUN useradd -m -s /bin/bash linuxbrew \
+ && su linuxbrew -c 'NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"' \
+ && chmod -R g+rwX /home/linuxbrew/.linuxbrew
+
+# The cloud CLIs.
+RUN case "${TARGETARCH}" in amd64) aws_arch=x86_64 ; gcp_arch=x86_64 ;; arm64) aws_arch=aarch64 ; gcp_arch=arm ;; esac \
+ && curl -fsSL -o /tmp/awscli.zip "https://awscli.amazonaws.com/awscli-exe-linux-${aws_arch}.zip" \
+ && unzip -q /tmp/awscli.zip -d /tmp \
+ && /tmp/aws/install \
+ && rm -rf /tmp/awscli.zip /tmp/aws \
+ && curl -fsSL -o /tmp/sam.zip "https://github.com/aws/aws-sam-cli/releases/latest/download/aws-sam-cli-linux-${aws_arch}.zip" \
+ && unzip -q /tmp/sam.zip -d /tmp/sam \
+ && /tmp/sam/install \
+ && rm -rf /tmp/sam.zip /tmp/sam \
+ && curl -fsSL -o /tmp/session-manager.deb \
+        "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_$(dpkg --print-architecture)/session-manager-plugin.deb" \
+ && dpkg -i /tmp/session-manager.deb \
+ && rm /tmp/session-manager.deb \
+ && curl -fsSL "https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-linux-${gcp_arch}.tar.gz" \
+        | tar -xz -C /usr/local \
+ && /usr/local/google-cloud-sdk/install.sh --quiet --path-update false --usage-reporting false \
+ && for bin in gcloud gsutil bq; do ln -sf "/usr/local/google-cloud-sdk/bin/${bin}" "/usr/local/bin/${bin}"; done
+
+RUN curl -fsSL https://aka.ms/InstallAzureCLIDeb | bash \
+ && az extension add --name azure-devops --system \
+ && curl -fsSL -o /usr/local/bin/bicep \
+        "https://github.com/Azure/bicep/releases/latest/download/bicep-linux-$(dpkg --print-architecture)" \
+ && chmod 0755 /usr/local/bin/bicep \
+ && case "${TARGETARCH}" in amd64) az_arch=amd64 ;; arm64) az_arch=arm64 ;; esac \
+ && curl -fsSL "https://aka.ms/downloadazcopy-v10-linux" \
+        | tar -xz --strip-components=1 -C /usr/local/bin --wildcards '*/azcopy' \
+ && chmod 0755 /usr/local/bin/azcopy \
+ && ln -sf /usr/local/bin/azcopy /usr/local/bin/azcopy10
+
+# GitHub's own CLI, and the tools that talk to registries and clusters.
+RUN mkdir -p /etc/apt/keyrings \
+ && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        -o /etc/apt/keyrings/githubcli.gpg \
+ && chmod a+r /etc/apt/keyrings/githubcli.gpg \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends gh podman buildah skopeo \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN arch="$(dpkg --print-architecture)" \
+ && curl -fsSL -o /usr/local/bin/kubectl \
+        "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/${arch}/kubectl" \
+ && curl -fsSL -o /usr/local/bin/kind \
+        "https://kind.sigs.k8s.io/dl/latest/kind-linux-${arch}" \
+ && curl -fsSL -o /usr/local/bin/minikube \
+        "https://storage.googleapis.com/minikube/releases/latest/minikube-linux-${arch}" \
+ && chmod 0755 /usr/local/bin/kubectl /usr/local/bin/kind /usr/local/bin/minikube \
+ && curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash \
+ && kustomize_tag="$(curl -fsSL https://api.github.com/repos/kubernetes-sigs/kustomize/releases | jq -r '[.[].tag_name | select(startswith("kustomize/"))] | first')" \
+ && kustomize_version="${kustomize_tag#kustomize/v}" \
+ && curl -fsSL "https://github.com/kubernetes-sigs/kustomize/releases/download/${kustomize_tag}/kustomize_v${kustomize_version}_linux_${arch}.tar.gz" \
+        | tar -xz -C /usr/local/bin kustomize \
+ && chmod 0755 /usr/local/bin/kustomize
+
+# Terraform, Packer, Pulumi, and the smaller CLIs of the toolset.
+RUN arch="$(dpkg --print-architecture)" \
+ && curl -fsSL https://apt.releases.hashicorp.com/gpg -o /etc/apt/keyrings/hashicorp.asc \
+ && chmod a+r /etc/apt/keyrings/hashicorp.asc \
+ && echo "deb [arch=${arch} signed-by=/etc/apt/keyrings/hashicorp.asc] https://apt.releases.hashicorp.com $(. /etc/os-release && echo "${UBUNTU_CODENAME}") main" \
+        > /etc/apt/sources.list.d/hashicorp.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends terraform packer \
+ && rm -rf /var/lib/apt/lists/* \
+ && curl -fsSL https://get.pulumi.com | HOME=/usr/local sh -s -- --install-root /usr/local \
+ && curl -fsSL -o /usr/local/bin/yq \
+        "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_${arch}" \
+ && chmod 0755 /usr/local/bin/yq \
+ && curl -fsSL "https://github.com/oras-project/oras/releases/latest/download/oras_$(curl -fsSL https://api.github.com/repos/oras-project/oras/releases/latest | jq -r .tag_name | tr -d v)_linux_${arch}.tar.gz" \
+        | tar -xz -C /usr/local/bin oras \
+ && chmod 0755 /usr/local/bin/oras
+
+# The browsers and their drivers, with the paths GitHub exports for them.
+#
+# amd64 only. Google publishes no arm64 Chrome for Linux and Microsoft no arm64
+# Edge, so an arm64 machine gets Firefox and no more. A workflow that drives
+# Chrome is an amd64 workflow, on GitHub as well as here.
+ENV CHROMEWEBDRIVER=/usr/local/share/chromedriver-linux64 \
+    EDGEWEBDRIVER=/usr/local/share/edge_driver \
+    GECKOWEBDRIVER=/usr/local/share/gecko_driver \
+    SELENIUM_JAR_PATH=/usr/share/java/selenium-server.jar
+
+RUN install -m 0755 -d /etc/apt/keyrings \
+ && curl -fsSL https://packages.mozilla.org/apt/repo-signing-key.gpg \
+        -o /etc/apt/keyrings/packages.mozilla.org.asc \
+ && chmod a+r /etc/apt/keyrings/packages.mozilla.org.asc \
+ && echo "deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main" \
+        > /etc/apt/sources.list.d/mozilla.list \
+ && printf '%s\n' \
+        'Package: *' \
+        'Pin: origin packages.mozilla.org' \
+        'Pin-Priority: 1000' \
+        > /etc/apt/preferences.d/mozilla \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends firefox \
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p "${GECKOWEBDRIVER}" \
+ && gecko="$(curl -fsSL https://api.github.com/repos/mozilla/geckodriver/releases/latest | jq -r .tag_name)" \
+ && case "${TARGETARCH}" in amd64) gk_arch=linux64 ;; arm64) gk_arch=linux-aarch64 ;; esac \
+ && curl -fsSL "https://github.com/mozilla/geckodriver/releases/download/${gecko}/geckodriver-${gecko}-${gk_arch}.tar.gz" \
+        | tar -xz -C "${GECKOWEBDRIVER}" \
+ && ln -sf "${GECKOWEBDRIVER}/geckodriver" /usr/local/bin/geckodriver \
+ && mkdir -p /usr/share/java \
+ && curl -fsSL -o "${SELENIUM_JAR_PATH}" \
+        "https://github.com/SeleniumHQ/selenium/releases/download/selenium-4.47.0/selenium-server-4.47.0.jar"
+
+RUN if [ "${TARGETARCH}" = "amd64" ]; then \
+        curl -fsSL -o /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+     && apt-get update \
+     && apt-get install -y --no-install-recommends /tmp/chrome.deb \
+     && rm /tmp/chrome.deb \
+     && chrome_version="$(google-chrome --product-version)" \
+     && mkdir -p /usr/local/share \
+     && curl -fsSL -o /tmp/chromedriver.zip \
+            "https://storage.googleapis.com/chrome-for-testing-public/${chrome_version}/linux64/chromedriver-linux64.zip" \
+     && unzip -q /tmp/chromedriver.zip -d /usr/local/share \
+     && rm /tmp/chromedriver.zip \
+     && ln -sf "${CHROMEWEBDRIVER}/chromedriver" /usr/local/bin/chromedriver \
+     && curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+            | gpg --dearmor -o /etc/apt/keyrings/microsoft-edge.gpg \
+     && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft-edge.gpg] https://packages.microsoft.com/repos/edge stable main" \
+            > /etc/apt/sources.list.d/microsoft-edge.list \
+     && apt-get update \
+     && apt-get install -y --no-install-recommends microsoft-edge-stable \
+     && edge_version="$(microsoft-edge --version | awk '{print $3}')" \
+     && mkdir -p "${EDGEWEBDRIVER}" \
+     && curl -fsSL -o /tmp/edgedriver.zip \
+            "https://msedgedriver.microsoft.com/${edge_version}/edgedriver_linux64.zip" \
+     && unzip -q /tmp/edgedriver.zip -d "${EDGEWEBDRIVER}" \
+     && rm /tmp/edgedriver.zip \
+     && ln -sf "${EDGEWEBDRIVER}/msedgedriver" /usr/local/bin/msedgedriver \
+     && rm -rf /var/lib/apt/lists/* ; \
+    else \
+        echo "arm64: no Chrome and no Edge published for linux; Firefox only" ; \
+    fi
+
+# The databases and web servers, installed and left stopped.
+#
+# GitHub's image has these present and their units inactive, and a job starts
+# whichever it wants. Masked is wrong here: a masked unit cannot be started at
+# all, which is the opposite of what a workflow expects.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        postgresql-16 postgresql-client-16 \
+        mysql-server mysql-client \
+        nginx apache2 \
+ && rm -rf /var/lib/apt/lists/* \
+ && systemctl disable postgresql mysql nginx apache2
+
+# The CodeQL bundle, in the cache the action looks in.
+RUN codeql_tag="$(curl -fsSL https://api.github.com/repos/github/codeql-action/releases/latest | jq -r .tag_name)" \
+ && mkdir -p /opt/hostedtoolcache/CodeQL \
+ && curl -fsSL -o /tmp/codeql.tar.gz \
+        "https://github.com/github/codeql-action/releases/download/${codeql_tag}/codeql-bundle-linux64.tar.gz" \
+ && tar -xzf /tmp/codeql.tar.gz -C /opt/hostedtoolcache/CodeQL \
+ && rm /tmp/codeql.tar.gz
+
+# What every job's shell has to see.
+#
+# `setup-*` actions read AGENT_TOOLSDIRECTORY to find the cache, and a job runs
+# as `runner`, so the PATH additions above have to be on that user's PATH too.
+ENV AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache \
+    ImageOS=ubuntu26 \
+    RUNNER_TOOL_CACHE=/opt/hostedtoolcache
+
+RUN chown -R runner:runner /opt/hostedtoolcache \
+ && printf '%s\n' \
+        'export PATH="/usr/share/rust/.cargo/bin:/usr/local/.ghcup/bin:/usr/local/go/bin:$PATH"' \
+        > /etc/profile.d/makecore-toolchains.sh \
+ && chmod 0644 /etc/profile.d/makecore-toolchains.sh
 
 # What a machine must not start on its own.
 #
