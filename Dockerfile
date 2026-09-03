@@ -108,6 +108,7 @@ RUN apt-get update \
 # The GitHub Actions runner, where the config disk of a machine expects it.
 RUN useradd -m -s /bin/bash runner \
  && usermod -aG docker runner \
+ && install -d -o runner -g runner /opt/hostedtoolcache \
  && case "${TARGETARCH}" in \
         amd64) runner_arch=x64 ;; \
         arm64) runner_arch=arm64 ;; \
@@ -155,6 +156,7 @@ RUN case "${TARGETARCH}" in \
             | tar -xJ --strip-components=1 -C "${target}" ; \
         touch "/opt/hostedtoolcache/node/${version}/${node_arch}.complete" ; \
     done \
+ && chown -R runner:runner /opt/hostedtoolcache/node \
  && ln -sf "/opt/hostedtoolcache/node/${NODE_LTS_A}/${node_arch}/bin/node" /usr/local/bin/node \
  && ln -sf "/opt/hostedtoolcache/node/${NODE_LTS_A}/${node_arch}/bin/npm" /usr/local/bin/npm \
  && ln -sf "/opt/hostedtoolcache/node/${NODE_LTS_A}/${node_arch}/bin/npx" /usr/local/bin/npx
@@ -293,6 +295,7 @@ RUN for prefix in /opt/hostedtoolcache/node/*/*/ ; do \
         "${prefix}bin/npm" install -g --prefix "${prefix}" \
             node-gyp grunt gulp n parcel typescript newman \
             webpack webpack-cli lerna yarn ; \
+        chown -R runner:runner "${prefix}lib/node_modules" "${prefix}bin" ; \
     done
 
 # Python, in the tool cache layout `setup-python` reads.
@@ -327,6 +330,7 @@ RUN case "${TARGETARCH}" in \
         "${tmp}/setup.sh" ; \
         rm -rf "${tmp}" ; \
     done \
+ && chown -R runner:runner /opt/hostedtoolcache/Python \
  && ln -sf "/opt/hostedtoolcache/Python/$(ls /opt/hostedtoolcache/Python | sort -V | tail -n1)/${tc_arch}/bin/python3" /usr/local/bin/python3
 
 # pipx, and the two packages the toolset installs with it.
@@ -359,7 +363,8 @@ RUN case "${TARGETARCH}" in \
         curl -fsSL "https://go.dev/dl/go${version}.linux-${dl_arch}.tar.gz" \
             | tar -xz --strip-components=1 -C "${target}" ; \
         touch "/opt/hostedtoolcache/go/${version}/${tc_arch}.complete" ; \
-    done
+    done \
+ && chown -R runner:runner /opt/hostedtoolcache/go
 
 # Ruby, in the tool cache, from the builds `setup-ruby` uses.
 #
@@ -396,7 +401,8 @@ RUN case "${TARGETARCH}" in \
  && default="/opt/hostedtoolcache/Ruby/$(ls /opt/hostedtoolcache/Ruby | sort -V | tail -n1)/${tc_arch}" \
  && ln -sf "${default}/bin/ruby" /usr/local/bin/ruby \
  && ln -sf "${default}/bin/gem" /usr/local/bin/gem \
- && "${default}/bin/gem" install --no-document multi_json fastlane
+ && "${default}/bin/gem" install --no-document multi_json fastlane \
+ && chown -R runner:runner /opt/hostedtoolcache/Ruby
 
 # Java. Five JDKs and the JAVA_HOME_<version>_<arch> variables that name them.
 #
@@ -791,7 +797,8 @@ RUN codeql_tag="$(curl -fsSL https://api.github.com/repos/github/codeql-action/r
  && curl -fsSL -o /tmp/codeql.tar.gz \
         "https://github.com/github/codeql-action/releases/download/${codeql_tag}/codeql-bundle-linux64.tar.gz" \
  && tar -xzf /tmp/codeql.tar.gz -C /opt/hostedtoolcache/CodeQL \
- && rm /tmp/codeql.tar.gz
+ && rm /tmp/codeql.tar.gz \
+ && chown -R runner:runner /opt/hostedtoolcache/CodeQL
 
 # What every job's shell has to see.
 #
@@ -801,8 +808,7 @@ ENV AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache \
     ImageOS=ubuntu26 \
     RUNNER_TOOL_CACHE=/opt/hostedtoolcache
 
-RUN chown -R runner:runner /opt/hostedtoolcache \
- && printf '%s\n' \
+RUN printf '%s\n' \
         'export PATH="/usr/share/rust/.cargo/bin:/usr/local/.ghcup/bin:/usr/local/go/bin:$PATH"' \
         > /etc/profile.d/makecore-toolchains.sh \
  && chmod 0644 /etc/profile.d/makecore-toolchains.sh
