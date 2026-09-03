@@ -231,14 +231,14 @@ RUN if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then \
 # code, not the package, and a list this long is not something to bisect by hand.
 ARG APT_TOOLSET_PACKAGES="\
         bzip2 curl g++ gcc make jq tar unzip wget \
-        autoconf automake dbus dnsutils dpkg dpkg-dev fakeroot \
+        autoconf automake dbus bind9-dnsutils dpkg dpkg-dev fakeroot \
         fonts-noto-color-emoji gnupg2 iproute2 iputils-ping libyaml-dev \
         libtool libssl-dev libicu-dev libsqlite3-dev locales mercurial \
-        openssh-client p7zip-rar pkg-config python-is-python3 rpm texinfo \
+        openssh-client pkg-config python-is-python3 rpm texinfo \
         tk tree tzdata upx-ucl xvfb xz-utils zsync \
         acl aria2 binutils bison brotli libnss3-tools coreutils file \
         findutils flex ftp haveged lz4 m4 mediainfo netcat-openbsd net-tools \
-        p7zip-full parallel patchelf pigz pollinate rsync shellcheck \
+        7zip 7zip-rar parallel patchelf pigz pollinate rsync shellcheck \
         sphinxsearch sqlite3 ssh sshpass sudo systemd-coredump swig \
         telnet time zip"
 
@@ -265,9 +265,9 @@ RUN apt-get update \
         gcc-12 g++-12 gfortran-12 \
         gcc-13 g++-13 gfortran-13 \
         gcc-14 g++-14 gfortran-14 \
-        clang-16 clang-17 clang-18 \
-        clang-format-16 clang-format-17 clang-format-18 \
-        clang-tidy-16 clang-tidy-17 clang-tidy-18 \
+        clang-17 clang-18 clang-19 \
+        clang-format-17 clang-format-18 clang-format-19 \
+        clang-tidy-17 clang-tidy-18 clang-tidy-19 \
         lld-18 llvm-18 \
  && update-alternatives --install /usr/bin/clang clang /usr/bin/clang-18 100 \
  && update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-18 100 \
@@ -424,35 +424,43 @@ RUN curl -fsSL "https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/b
  && apt-get install -y --no-install-recommends ant \
  && rm -rf /var/lib/apt/lists/*
 
-# Microsoft's archive: .NET and PowerShell.
+# .NET, from the install script rather than from apt.
 #
-# The feed is named for a release, and 26.04 may not have one on the day this
-# builds. The newest feed that exists is resolved rather than hard-coded, so
-# this layer does not have to be edited the moment Microsoft publishes one.
-RUN . /etc/os-release \
- && for candidate in "${VERSION_ID}" 25.10 25.04 24.04; do \
-        if curl -fsIL -o /dev/null "https://packages.microsoft.com/config/ubuntu/${candidate}/packages-microsoft-prod.deb"; then \
-            feed="${candidate}" ; break ; \
-        fi ; \
-    done \
- && if [ -z "${feed:-}" ]; then echo "no microsoft feed for this release" >&2; exit 1; fi \
- && echo "microsoft feed: ubuntu/${feed}" \
- && curl -fsSL -o /tmp/ms-prod.deb "https://packages.microsoft.com/config/ubuntu/${feed}/packages-microsoft-prod.deb" \
- && dpkg -i /tmp/ms-prod.deb \
- && rm /tmp/ms-prod.deb \
- && apt-get update \
- && apt-get install -y --no-install-recommends \
-        dotnet-sdk-8.0 dotnet-sdk-9.0 \
-        powershell \
- && rm -rf /var/lib/apt/lists/*
+# Microsoft's prod feed for 26.04 exists but carries no dotnet-sdk at all, and
+# 26.04's own archive has only .NET 10 -- neither can produce the 8/9/10 set
+# GitHub's image has. dotnet-install.sh is release-independent and installs the
+# channels side by side under one root, which is what `dotnet --list-sdks`
+# wants anyway.
+ARG DOTNET_CHANNELS="8.0 9.0 10.0"
 
-# .NET 10, which the archive above does not carry yet, from the install script.
 RUN curl -fsSL -o /tmp/dotnet-install.sh https://dot.net/v1/dotnet-install.sh \
  && chmod +x /tmp/dotnet-install.sh \
- && /tmp/dotnet-install.sh --channel 10.0 --install-dir /usr/share/dotnet --no-path \
+ && for channel in ${DOTNET_CHANNELS}; do \
+        echo "dotnet sdk ${channel}" ; \
+        /tmp/dotnet-install.sh --channel "${channel}" --install-dir /usr/share/dotnet --no-path ; \
+    done \
  && rm /tmp/dotnet-install.sh \
  && ln -sf /usr/share/dotnet/dotnet /usr/local/bin/dotnet \
+ && dotnet --list-sdks \
  && DOTNET_CLI_TELEMETRY_OPTOUT=1 dotnet tool install --tool-path /usr/local/bin nbgv
+
+# PowerShell, from the release tarball.
+#
+# There is no `powershell` package for 26.04 in any Microsoft feed, so the
+# distro-independent archive is the only way in. Same binary the deb ships.
+RUN case "${TARGETARCH}" in \
+        amd64) pwsh_arch=x64 ;; \
+        arm64) pwsh_arch=arm64 ;; \
+        *) echo "no powershell build for ${TARGETARCH}" >&2 ; exit 1 ;; \
+    esac \
+ && pwsh_version="$(curl -fsSL https://api.github.com/repos/PowerShell/PowerShell/releases/latest | jq -r '.tag_name | ltrimstr("v")')" \
+ && echo "powershell ${pwsh_version} ${pwsh_arch}" \
+ && mkdir -p /opt/microsoft/powershell/7 \
+ && curl -fsSL "https://github.com/PowerShell/PowerShell/releases/download/v${pwsh_version}/powershell-${pwsh_version}-linux-${pwsh_arch}.tar.gz" \
+        | tar -xz -C /opt/microsoft/powershell/7 \
+ && chmod 0755 /opt/microsoft/powershell/7/pwsh \
+ && ln -sf /opt/microsoft/powershell/7/pwsh /usr/bin/pwsh \
+ && pwsh --version
 
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 \
     DOTNET_NOLOGO=1 \
@@ -498,22 +506,25 @@ RUN apt-get update \
  && rm /tmp/ghcup \
  && chmod -R a+rX /usr/local/.ghcup
 
-# PHP, from ondrej's archive.
+# PHP, from the archive.
 #
-# 26.04 ships a newer PHP than GitHub's image has, and a workflow pinned to 8.3
-# has to find 8.3. The archive is the only place that still carries it.
-ARG PHP_VERSION=8.3
-
+# ondrej's PPA publishes nothing for 26.04, so pinning 8.3 the way GitHub's
+# image does is not available here; this takes whatever the release ships
+# (8.5 at time of writing). A workflow that needs a specific PHP uses
+# shivammathur/setup-php, which downloads its own regardless.
+#
+# The version is resolved from the archive instead of pinned so this layer
+# does not break the next time the default moves.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends software-properties-common \
- && add-apt-repository -y ppa:ondrej/php \
- && apt-get update \
+ && php_version="$(apt-cache depends php | awk '/Depends: php[0-9]/ {sub(/^php/,"",$2); print $2; exit}')" \
+ && if [ -z "${php_version}" ]; then echo "cannot resolve a php version from the archive" >&2; exit 1; fi \
+ && echo "php ${php_version}" \
  && apt-get install -y --no-install-recommends \
-        "php${PHP_VERSION}" "php${PHP_VERSION}-cli" "php${PHP_VERSION}-common" \
-        "php${PHP_VERSION}-curl" "php${PHP_VERSION}-mbstring" "php${PHP_VERSION}-xml" \
-        "php${PHP_VERSION}-zip" "php${PHP_VERSION}-bcmath" "php${PHP_VERSION}-intl" \
-        "php${PHP_VERSION}-sqlite3" "php${PHP_VERSION}-mysql" "php${PHP_VERSION}-pgsql" \
-        "php${PHP_VERSION}-xdebug" "php${PHP_VERSION}-pcov" \
+        "php${php_version}" "php${php_version}-cli" "php${php_version}-common" \
+        "php${php_version}-curl" "php${php_version}-mbstring" "php${php_version}-xml" \
+        "php${php_version}-zip" "php${php_version}-bcmath" "php${php_version}-intl" \
+        "php${php_version}-sqlite3" "php${php_version}-mysql" "php${php_version}-pgsql" \
+        "php${php_version}-xdebug" "php${php_version}-pcov" \
  && rm -rf /var/lib/apt/lists/* \
  && curl -fsSL https://getcomposer.org/installer -o /tmp/composer-setup.php \
  && php /tmp/composer-setup.php --install-dir=/usr/local/bin --filename=composer \
@@ -737,7 +748,7 @@ RUN if [ "${TARGETARCH}" = "amd64" ]; then \
 # all, which is the opposite of what a workflow expects.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-        postgresql-16 postgresql-client-16 \
+        postgresql-18 postgresql-client-18 \
         mysql-server mysql-client \
         nginx apache2 \
  && rm -rf /var/lib/apt/lists/* \
