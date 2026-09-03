@@ -173,8 +173,6 @@ RUN apt-get update \
         python3 \
         python3-pip \
         python3-venv \
-        openjdk-21-jdk-headless \
-        openjdk-17-jdk-headless \
  && rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
@@ -194,6 +192,20 @@ RUN apt-get update \
 # Nothing is installed with `|| true`. A name that moved must fail the build and
 # be fixed here, not disappear into an image that ships a hole where a toolchain
 # was supposed to be.
+#
+# What is deliberately absent, and why. Each of these cost more build minutes
+# than the workflows on this fleet get back, and each has a `setup-*` action
+# that installs it on demand:
+#
+#   Swift, Haskell (GHC/cabal/stack), Julia, Kotlin, Miniconda, Homebrew,
+#   the PowerShell Az and Microsoft.Graph modules, the CodeQL bundle,
+#   Temurin 8/11/25, ant.
+#
+# The CodeQL bundle is the one to understand: `github/codeql-action` downloads
+# its own when the tool cache has none, so a code-scanning job still works and
+# only pays the download. The rest break a workflow that assumes them without
+# asking a `setup-*` action first. PHP, .NET, Rust, PowerShell itself, the
+# browsers, the cloud CLIs and the full gcc/clang matrix all stay.
 # ---------------------------------------------------------------------------
 
 # universe and multiverse, which most of the list below lives in.
@@ -412,12 +424,15 @@ RUN case "${TARGETARCH}" in \
  && "${default}/bin/gem" install --no-document multi_json fastlane \
  && chown -R runner:runner /opt/hostedtoolcache/Ruby
 
-# Java. Five JDKs and the JAVA_HOME_<version>_<arch> variables that name them.
+# Java, and the JAVA_HOME_<version>_<arch> variables that name each JDK.
 #
-# From Adoptium, not from apt. This release archives no openjdk-8 at all, and
-# Temurin is where GitHub takes these from anyway, so one source serves all five
-# and the set does not thin out as the distribution drops old ones.
-ARG JAVA_VERSIONS="8 11 17 21 25"
+# From Adoptium, not from apt: Temurin is where GitHub takes these from anyway,
+# and one source does not thin out as the distribution drops old JDKs.
+#
+# Two, not GitHub's five. 8, 11 and 25 are 420 MB of JDK for versions nothing
+# here builds against, and `setup-java` downloads any of them on demand. A
+# workflow pinning one of those without `setup-java` is the case this breaks.
+ARG JAVA_VERSIONS="17 21"
 ARG JAVA_DEFAULT=17
 
 RUN case "${TARGETARCH}" in \
@@ -440,7 +455,7 @@ RUN case "${TARGETARCH}" in \
 
 ENV JAVA_HOME=/usr/lib/jvm/temurin-17
 
-# Maven, Gradle and Ant, which the toolset carries beside the JDKs.
+# Maven and Gradle, which the toolset carries beside the JDKs.
 ARG MAVEN_VERSION=3.9.16
 ARG GRADLE_VERSION=9.7.1
 
@@ -450,10 +465,7 @@ RUN curl -fsSL "https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/b
  && curl -fsSL -o /tmp/gradle.zip "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" \
  && unzip -q /tmp/gradle.zip -d /opt \
  && rm /tmp/gradle.zip \
- && ln -sf "/opt/gradle-${GRADLE_VERSION}/bin/gradle" /usr/local/bin/gradle \
- && apt-get update \
- && apt-get install -y --no-install-recommends ant \
- && rm -rf /var/lib/apt/lists/*
+ && ln -sf "/opt/gradle-${GRADLE_VERSION}/bin/gradle" /usr/local/bin/gradle
 
 # .NET, from the install script rather than from apt.
 #
@@ -498,13 +510,13 @@ ENV DOTNET_ROOT=/usr/share/dotnet \
     DOTNET_NOLOGO=1 \
     DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
 
-# The PowerShell modules of the toolset.
+# The PowerShell modules of the toolset, minus Az and Microsoft.Graph.
 #
-# Az is several hundred megabytes and the slowest thing in this file to install.
+# Those two were the slowest step in this file by a wide margin, and a workflow
+# that wants them can `Install-Module Az` itself. Pester and PSScriptAnalyzer
+# are small, fast, and what a PowerShell job actually reaches for.
 RUN pwsh -NoProfile -Command \
         "Set-PSRepository -Name PSGallery -InstallationPolicy Trusted; \
-         Install-Module -Name Az -RequiredVersion 15.6.1 -Scope AllUsers -Force; \
-         Install-Module -Name Microsoft.Graph -Scope AllUsers -Force; \
          Install-Module -Name Pester -RequiredVersion 5.9.0 -Scope AllUsers -Force -SkipPublisherCheck; \
          Install-Module -Name PSScriptAnalyzer -Scope AllUsers -Force"
 
@@ -518,30 +530,6 @@ RUN curl -fsSL https://sh.rustup.rs \
         | sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path \
  && /usr/share/rust/.cargo/bin/rustup component add rustfmt clippy \
  && chmod -R a+rwX /usr/share/rust
-
-# Haskell: GHC, cabal and stack, through ghcup.
-ENV GHCUP_INSTALL_BASE_PREFIX=/usr/local \
-    PATH=/usr/local/.ghcup/bin:$PATH
-
-RUN apt-get update \
- && apt-get install -y --no-install-recommends libnuma-dev libgmp-dev \
- && rm -rf /var/lib/apt/lists/* \
- && case "${TARGETARCH}" in \
-        amd64) ghcup_arch=x86_64 ;; \
-        arm64) ghcup_arch=aarch64 ;; \
-        *) echo "no ghcup build for ${TARGETARCH}" >&2 ; exit 1 ;; \
-    esac \
- && curl -fsSL -o /tmp/ghcup "https://downloads.haskell.org/~ghcup/${ghcup_arch}-linux-ghcup" \
- && chmod +x /tmp/ghcup \
- && BOOTSTRAP_HASKELL_NONINTERACTIVE=1 \
-    BOOTSTRAP_HASKELL_INSTALL_STACK=1 \
-    BOOTSTRAP_HASKELL_ADJUST_BASHRC=0 \
-    /tmp/ghcup install ghc --set latest \
- && /tmp/ghcup install cabal latest \
- && /tmp/ghcup install stack latest \
- && install -m 0755 /tmp/ghcup /usr/local/bin/ghcup \
- && rm /tmp/ghcup \
- && chmod -R a+rX /usr/local/.ghcup
 
 # PHP, from the archive.
 #
@@ -569,45 +557,6 @@ RUN apt-get update \
  && curl -fsSL -o /usr/local/bin/phpunit https://phar.phpunit.de/phpunit-8.phar \
  && chmod 0755 /usr/local/bin/phpunit
 
-# Kotlin, Julia and Swift.
-ARG KOTLIN_VERSION=2.4.10
-ARG JULIA_VERSION=1.12.7
-ARG SWIFT_VERSION=6.3.3
-
-RUN curl -fsSL -o /tmp/kotlin.zip \
-        "https://github.com/JetBrains/kotlin/releases/download/v${KOTLIN_VERSION}/kotlin-compiler-${KOTLIN_VERSION}.zip" \
- && unzip -q /tmp/kotlin.zip -d /usr/local \
- && rm /tmp/kotlin.zip \
- && for bin in /usr/local/kotlinc/bin/*; do ln -sf "${bin}" "/usr/local/bin/$(basename "${bin}")"; done \
- && case "${TARGETARCH}" in amd64) jl_arch=x64 ; jl_dir=x86_64 ;; arm64) jl_arch=aarch64 ; jl_dir=aarch64 ;; esac \
- && curl -fsSL "https://julialang-s3.julialang.org/bin/linux/${jl_arch}/${JULIA_VERSION%.*}/julia-${JULIA_VERSION}-linux-${jl_dir}.tar.gz" \
-        | tar -xz -C /opt \
- && ln -sf "/opt/julia-${JULIA_VERSION}/bin/julia" /usr/local/bin/julia
-
-RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-        binutils-gold libcurl4-openssl-dev libedit2 libncurses-dev \
-        libpython3-dev libxml2-dev libz3-dev \
- && rm -rf /var/lib/apt/lists/* \
- && . /etc/os-release \
- && case "${TARGETARCH}" in \
-        amd64) swift_suffix="" ;; \
-        arm64) swift_suffix="-aarch64" ;; \
-        *) echo "no swift build for ${TARGETARCH}" >&2 ; exit 1 ;; \
-    esac \
- && for candidate in "${VERSION_ID}" 24.04 22.04; do \
-        dir="ubuntu${candidate//./}${swift_suffix}" ; \
-        url="https://download.swift.org/swift-${SWIFT_VERSION}-release/${dir}/swift-${SWIFT_VERSION}-RELEASE/swift-${SWIFT_VERSION}-RELEASE-ubuntu${candidate}${swift_suffix}.tar.gz" ; \
-        if curl -fsIL -o /dev/null "${url}"; then swift_url="${url}" ; break ; fi ; \
-    done \
- && if [ -z "${swift_url:-}" ]; then echo "no swift ${SWIFT_VERSION} build for this release" >&2; exit 1; fi \
- && echo "swift: ${swift_url}" \
- && mkdir -p /opt/swift \
- && curl -fsSL "${swift_url}" | tar -xz --strip-components=1 -C /opt/swift \
- && ln -sf /opt/swift/usr/bin/swift /usr/local/bin/swift \
- && ln -sf /opt/swift/usr/bin/swiftc /usr/local/bin/swiftc \
- && swift --version
-
 # The build tools: cmake, ninja, bazel and vcpkg.
 #
 # cmake is pinned where GitHub pins it. Their note says 4.0 breaks projects that
@@ -631,22 +580,6 @@ RUN case "${TARGETARCH}" in amd64) cm_arch=x86_64 ;; arm64) cm_arch=aarch64 ;; e
  && chmod -R a+rwX /usr/local/share/vcpkg
 
 ENV VCPKG_INSTALLATION_ROOT=/usr/local/share/vcpkg
-
-# Miniconda and Homebrew, where GitHub's CONDA and brew notes say they are.
-#
-# Homebrew is installed but deliberately left off PATH, as on GitHub: a job that
-# wants it runs `eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"`.
-RUN curl -fsSL -o /tmp/miniconda.sh \
-        "https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-$(uname -m).sh" \
- && bash /tmp/miniconda.sh -b -p /usr/share/miniconda \
- && rm /tmp/miniconda.sh \
- && chmod -R a+rX /usr/share/miniconda
-
-ENV CONDA=/usr/share/miniconda
-
-RUN useradd -m -s /bin/bash linuxbrew \
- && su linuxbrew -c 'NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"' \
- && chmod -R g+rwX /home/linuxbrew/.linuxbrew
 
 # The cloud CLIs.
 RUN case "${TARGETARCH}" in amd64) aws_arch=x86_64 ; gcp_arch=x86_64 ;; arm64) aws_arch=aarch64 ; gcp_arch=arm ;; esac \
@@ -800,15 +733,6 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* \
  && systemctl disable postgresql mysql nginx apache2
 
-# The CodeQL bundle, in the cache the action looks in.
-RUN codeql_tag="$(curl -fsSL https://api.github.com/repos/github/codeql-action/releases/latest | jq -r .tag_name)" \
- && mkdir -p /opt/hostedtoolcache/CodeQL \
- && curl -fsSL -o /tmp/codeql.tar.gz \
-        "https://github.com/github/codeql-action/releases/download/${codeql_tag}/codeql-bundle-linux64.tar.gz" \
- && tar -xzf /tmp/codeql.tar.gz -C /opt/hostedtoolcache/CodeQL \
- && rm /tmp/codeql.tar.gz \
- && chown -R runner:runner /opt/hostedtoolcache/CodeQL
-
 # What every job's shell has to see.
 #
 # `setup-*` actions read AGENT_TOOLSDIRECTORY to find the cache, and a job runs
@@ -818,7 +742,7 @@ ENV AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache \
     RUNNER_TOOL_CACHE=/opt/hostedtoolcache
 
 RUN printf '%s\n' \
-        'export PATH="/usr/share/rust/.cargo/bin:/usr/local/.ghcup/bin:/usr/local/go/bin:$PATH"' \
+        'export PATH="/usr/share/rust/.cargo/bin:/usr/local/go/bin:$PATH"' \
         > /etc/profile.d/makecore-toolchains.sh \
  && chmod 0644 /etc/profile.d/makecore-toolchains.sh
 
