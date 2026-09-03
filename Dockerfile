@@ -300,6 +300,10 @@ RUN for prefix in /opt/hostedtoolcache/node/*/*/ ; do \
 # The versions come from `actions/python-versions`, which is where the action
 # itself would download them from. Building them here rather than letting each
 # job fetch one is the whole point of a cache.
+#
+# Each version is published for several Ubuntu releases, so the release has to
+# be part of the selection -- without it jq returns every match and the URL is
+# three URLs. This release's own build is preferred and 24.04 is the fallback.
 ARG PYTHON_VERSIONS="3.10 3.11 3.12 3.13 3.14"
 
 RUN case "${TARGETARCH}" in \
@@ -307,10 +311,15 @@ RUN case "${TARGETARCH}" in \
         arm64) tc_arch=arm64 ;; \
         *) echo "unsupported architecture ${TARGETARCH}" >&2; exit 1 ;; \
     esac \
+ && . /etc/os-release \
  && manifest="$(curl -fsSL https://raw.githubusercontent.com/actions/python-versions/main/versions-manifest.json)" \
  && for series in ${PYTHON_VERSIONS}; do \
-        url="$(echo "${manifest}" | jq -r --arg s "${series}." --arg a "${tc_arch}" '[.[] | select(.version | startswith($s)) | select(.stable)] | first | .files[] | select(.platform == "linux" and .arch == $a) | .download_url')" ; \
-        if [ -z "${url}" ] || [ "${url}" = "null" ]; then \
+        url="" ; \
+        for pv in "${VERSION_ID}" 24.04 22.04; do \
+            url="$(echo "${manifest}" | jq -r --arg s "${series}." --arg a "${tc_arch}" --arg p "${pv}" '[.[] | select(.version | startswith($s)) | select(.stable)] | first | [.files[] | select(.platform == "linux" and .arch == $a and .platform_version == $p) | .download_url] | first // empty')" ; \
+            if [ -n "${url}" ]; then echo "python ${series}: ubuntu ${pv}" ; break ; fi ; \
+        done ; \
+        if [ -z "${url}" ]; then \
             echo "no python ${series} for linux/${tc_arch} in the manifest" >&2 ; exit 1 ; \
         fi ; \
         tmp="$(mktemp -d)" ; \
@@ -354,9 +363,10 @@ RUN case "${TARGETARCH}" in \
 
 # Ruby, in the tool cache, from the builds `setup-ruby` uses.
 #
-# These are built for a specific Ubuntu release and 26.04 has none of its own
-# yet, so the 24.04 builds are what is fetched. They are dynamically linked
-# against libssl and libyaml, both installed above.
+# These are built for a specific Ubuntu release and for a specific arch, and
+# both belong in the asset name -- matching on the release alone also matches
+# the -arm64 asset of the same release. They are dynamically linked against
+# libssl and libyaml, both installed above.
 ARG RUBY_VERSIONS="3.2 3.3 3.4"
 
 RUN case "${TARGETARCH}" in \
@@ -364,11 +374,18 @@ RUN case "${TARGETARCH}" in \
         arm64) tc_arch=arm64 ;; \
         *) echo "unsupported architecture ${TARGETARCH}" >&2; exit 1 ;; \
     esac \
+ && . /etc/os-release \
+ && case "${TARGETARCH}" in amd64) rb_suffix="-x64" ;; arm64) rb_suffix="-arm64" ;; esac \
  && releases="$(curl -fsSL https://api.github.com/repos/ruby/ruby-builder/releases?per_page=100)" \
  && for series in ${RUBY_VERSIONS}; do \
-        url="$(echo "${releases}" | jq -r --arg s "ruby-${series}." '[.[].assets[] | select(.name | startswith($s)) | select(.name | contains("ubuntu-24.04"))] | sort_by(.name) | last | .browser_download_url')" ; \
-        if [ -z "${url}" ] || [ "${url}" = "null" ]; then \
-            echo "no ruby ${series} build for ubuntu-24.04" >&2 ; exit 1 ; \
+        url="" ; \
+        for pv in "${VERSION_ID}" 24.04 22.04; do \
+            url="$(echo "${releases}" | jq -r --arg s "ruby-${series}." --arg e "-ubuntu-${pv}${rb_suffix}.tar.gz" '[.[].assets[] | select(.name | startswith($s)) | select(.name | endswith($e))] | sort_by(.name | capture("^ruby-(?<v>[0-9]+(\\.[0-9]+)*)-").v | split(".") | map(tonumber)) | last | .browser_download_url // empty')" ; \
+            if [ -n "${url}" ] && [ "${url}" != "null" ]; then echo "ruby ${series}: ubuntu ${pv}${rb_suffix}" ; break ; fi ; \
+            url="" ; \
+        done ; \
+        if [ -z "${url}" ]; then \
+            echo "no ruby ${series} build for this release or its fallbacks" >&2 ; exit 1 ; \
         fi ; \
         version="$(basename "${url}" | sed -E 's/^ruby-([0-9.]+)-.*/\1/')" ; \
         target="/opt/hostedtoolcache/Ruby/${version}/${tc_arch}" ; \
@@ -494,7 +511,12 @@ ENV GHCUP_INSTALL_BASE_PREFIX=/usr/local \
 RUN apt-get update \
  && apt-get install -y --no-install-recommends libnuma-dev libgmp-dev \
  && rm -rf /var/lib/apt/lists/* \
- && curl -fsSL -o /tmp/ghcup https://downloads.haskell.org/~ghcup/x86_64-linux-ghcup \
+ && case "${TARGETARCH}" in \
+        amd64) ghcup_arch=x86_64 ;; \
+        arm64) ghcup_arch=aarch64 ;; \
+        *) echo "no ghcup build for ${TARGETARCH}" >&2 ; exit 1 ;; \
+    esac \
+ && curl -fsSL -o /tmp/ghcup "https://downloads.haskell.org/~ghcup/${ghcup_arch}-linux-ghcup" \
  && chmod +x /tmp/ghcup \
  && BOOTSTRAP_HASKELL_NONINTERACTIVE=1 \
     BOOTSTRAP_HASKELL_INSTALL_STACK=1 \
@@ -553,8 +575,14 @@ RUN apt-get update \
         libpython3-dev libxml2-dev libz3-dev \
  && rm -rf /var/lib/apt/lists/* \
  && . /etc/os-release \
- && for candidate in "${VERSION_ID//./}" 2404 2204; do \
-        url="https://download.swift.org/swift-${SWIFT_VERSION}-release/ubuntu${candidate}/swift-${SWIFT_VERSION}-RELEASE/swift-${SWIFT_VERSION}-RELEASE-ubuntu${candidate}.tar.gz" ; \
+ && case "${TARGETARCH}" in \
+        amd64) swift_suffix="" ;; \
+        arm64) swift_suffix="-aarch64" ;; \
+        *) echo "no swift build for ${TARGETARCH}" >&2 ; exit 1 ;; \
+    esac \
+ && for candidate in "${VERSION_ID}" 24.04 22.04; do \
+        dir="ubuntu${candidate//./}${swift_suffix}" ; \
+        url="https://download.swift.org/swift-${SWIFT_VERSION}-release/${dir}/swift-${SWIFT_VERSION}-RELEASE/swift-${SWIFT_VERSION}-RELEASE-ubuntu${candidate}${swift_suffix}.tar.gz" ; \
         if curl -fsIL -o /dev/null "${url}"; then swift_url="${url}" ; break ; fi ; \
     done \
  && if [ -z "${swift_url:-}" ]; then echo "no swift ${SWIFT_VERSION} build for this release" >&2; exit 1; fi \
@@ -562,7 +590,8 @@ RUN apt-get update \
  && mkdir -p /opt/swift \
  && curl -fsSL "${swift_url}" | tar -xz --strip-components=1 -C /opt/swift \
  && ln -sf /opt/swift/usr/bin/swift /usr/local/bin/swift \
- && ln -sf /opt/swift/usr/bin/swiftc /usr/local/bin/swiftc
+ && ln -sf /opt/swift/usr/bin/swiftc /usr/local/bin/swiftc \
+ && swift --version
 
 # The build tools: cmake, ninja, bazel and vcpkg.
 #
@@ -614,8 +643,9 @@ RUN case "${TARGETARCH}" in amd64) aws_arch=x86_64 ; gcp_arch=x86_64 ;; arm64) a
  && unzip -q /tmp/sam.zip -d /tmp/sam \
  && /tmp/sam/install \
  && rm -rf /tmp/sam.zip /tmp/sam \
+ && case "${TARGETARCH}" in amd64) sm_arch=64bit ;; arm64) sm_arch=arm64 ;; esac \
  && curl -fsSL -o /tmp/session-manager.deb \
-        "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_$(dpkg --print-architecture)/session-manager-plugin.deb" \
+        "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_${sm_arch}/session-manager-plugin.deb" \
  && dpkg -i /tmp/session-manager.deb \
  && rm /tmp/session-manager.deb \
  && curl -fsSL "https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-linux-${gcp_arch}.tar.gz" \
@@ -625,8 +655,9 @@ RUN case "${TARGETARCH}" in amd64) aws_arch=x86_64 ; gcp_arch=x86_64 ;; arm64) a
 
 RUN curl -fsSL https://aka.ms/InstallAzureCLIDeb | bash \
  && az extension add --name azure-devops --system \
+ && case "${TARGETARCH}" in amd64) bicep_arch=x64 ;; arm64) bicep_arch=arm64 ;; esac \
  && curl -fsSL -o /usr/local/bin/bicep \
-        "https://github.com/Azure/bicep/releases/latest/download/bicep-linux-$(dpkg --print-architecture)" \
+        "https://github.com/Azure/bicep/releases/latest/download/bicep-linux-${bicep_arch}" \
  && chmod 0755 /usr/local/bin/bicep \
  && case "${TARGETARCH}" in amd64) az_arch=amd64 ;; arm64) az_arch=arm64 ;; esac \
  && curl -fsSL "https://aka.ms/downloadazcopy-v10-linux" \
