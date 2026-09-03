@@ -194,23 +194,65 @@ RUN apt-get update \
 # was supposed to be.
 # ---------------------------------------------------------------------------
 
+# universe and multiverse, which most of the list below lives in.
+#
+# The base image enables main and restricted only. Nothing here is exotic —
+# shellcheck, mediainfo, aria2 and haveged are universe, p7zip-rar is
+# multiverse — but with the components off apt reports every one of them as an
+# unlocatable package, which is one error for what is really one cause.
+#
+# 26.04 writes its sources in deb822 at /etc/apt/sources.list.d/ubuntu.sources.
+# The one-line format is handled too, so this layer does not have to be revisited
+# if a future base image goes back to it.
+RUN if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then \
+        sed -i -E 's/^Components:.*/Components: main restricted universe multiverse/' \
+            /etc/apt/sources.list.d/ubuntu.sources ; \
+    elif [ -f /etc/apt/sources.list ]; then \
+        sed -i -E 's/^(deb(-src)? .*ubuntu[^ ]* [a-z-]+) main.*/\1 main restricted universe multiverse/' \
+            /etc/apt/sources.list ; \
+    else \
+        echo "this base image writes its apt sources somewhere new" >&2 ; exit 1 ; \
+    fi \
+ && grep -qE 'universe' /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list 2>/dev/null \
+    || { echo "universe is still not enabled after rewriting the sources" >&2; exit 1; }
+
 # The apt packages, as three lists: `vital`, `common` and `cmd` in the toolset.
 #
 # --no-install-recommends throughout, which is what GitHub does. A recommends
 # pulled in here is a package no workflow asked for on every root disk.
-RUN apt-get update \
- && apt-get install -y --no-install-recommends \
+#
+# `upx` rather than `upx-ucl` is what the toolset says, but on this release
+# `upx` is a virtual package and only `upx-ucl` provides it. The real name is
+# used here so the dependency resolver never has to make that choice.
+#
+# One `apt-get install` for the whole list, because seventy of them one at a
+# time is minutes of nothing. When that fails, the packages are retried singly
+# to find which name is the bad one — apt's own error names a file and an exit
+# code, not the package, and a list this long is not something to bisect by hand.
+ARG APT_TOOLSET_PACKAGES="\
         bzip2 curl g++ gcc make jq tar unzip wget \
         autoconf automake dbus dnsutils dpkg dpkg-dev fakeroot \
         fonts-noto-color-emoji gnupg2 iproute2 iputils-ping libyaml-dev \
         libtool libssl-dev libicu-dev libsqlite3-dev locales mercurial \
         openssh-client p7zip-rar pkg-config python-is-python3 rpm texinfo \
-        tk tree tzdata upx xvfb xz-utils zsync \
+        tk tree tzdata upx-ucl xvfb xz-utils zsync \
         acl aria2 binutils bison brotli libnss3-tools coreutils file \
         findutils flex ftp haveged lz4 m4 mediainfo netcat-openbsd net-tools \
         p7zip-full parallel patchelf pigz pollinate rsync shellcheck \
         sphinxsearch sqlite3 ssh sshpass sudo systemd-coredump swig \
-        telnet time zip \
+        telnet time zip"
+
+RUN apt-get update \
+ && if ! apt-get install -y --no-install-recommends ${APT_TOOLSET_PACKAGES}; then \
+        echo "=== the batch failed; finding which package ===" >&2 ; \
+        failed="" ; \
+        for pkg in ${APT_TOOLSET_PACKAGES}; do \
+            apt-get install -y --no-install-recommends "${pkg}" > /dev/null 2>&1 \
+                || failed="${failed} ${pkg}" ; \
+        done ; \
+        echo "packages this release will not install:${failed}" >&2 ; \
+        exit 1 ; \
+    fi \
  && locale-gen en_US.UTF-8 \
  && rm -rf /var/lib/apt/lists/*
 
