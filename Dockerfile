@@ -199,7 +199,7 @@ RUN apt-get update \
 # universe and multiverse, which most of the list below lives in.
 #
 # The base image enables main and restricted only. Nothing here is exotic —
-# shellcheck, mediainfo, aria2 and haveged are universe, p7zip-rar is
+# shellcheck, mediainfo, aria2 and haveged are universe, 7zip-rar is
 # multiverse — but with the components off apt reports every one of them as an
 # unlocatable package, which is one error for what is really one cause.
 #
@@ -307,6 +307,11 @@ RUN for prefix in /opt/hostedtoolcache/node/*/*/ ; do \
 # Each version is published for several Ubuntu releases, so the release has to
 # be part of the selection -- without it jq returns every match and the URL is
 # three URLs. This release's own build is preferred and 24.04 is the fallback.
+#
+# The tarball's setup.sh is shipped mode 0644 with no shebang and copies `./*`,
+# so it has to be fed to bash from inside its own directory rather than run.
+# It reads the tool cache path out of the environment, and the ENV that sets
+# that for the image is further down, so it is passed here explicitly.
 ARG PYTHON_VERSIONS="3.10 3.11 3.12 3.13 3.14"
 
 RUN case "${TARGETARCH}" in \
@@ -327,11 +332,14 @@ RUN case "${TARGETARCH}" in \
         fi ; \
         tmp="$(mktemp -d)" ; \
         curl -fsSL "${url}" | tar -xz -C "${tmp}" ; \
-        "${tmp}/setup.sh" ; \
+        ( cd "${tmp}" && AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache bash ./setup.sh ) ; \
         rm -rf "${tmp}" ; \
     done \
+ && newest="$(ls /opt/hostedtoolcache/Python | sort -V | tail -n1)" \
+ && if [ -z "${newest}" ]; then echo "the python setup script installed nothing" >&2; exit 1; fi \
  && chown -R runner:runner /opt/hostedtoolcache/Python \
- && ln -sf "/opt/hostedtoolcache/Python/$(ls /opt/hostedtoolcache/Python | sort -V | tail -n1)/${tc_arch}/bin/python3" /usr/local/bin/python3
+ && ln -sf "/opt/hostedtoolcache/Python/${newest}/${tc_arch}/bin/python3" /usr/local/bin/python3 \
+ && python3 --version
 
 # pipx, and the two packages the toolset installs with it.
 RUN apt-get update \
@@ -485,7 +493,8 @@ RUN case "${TARGETARCH}" in \
  && ln -sf /opt/microsoft/powershell/7/pwsh /usr/bin/pwsh \
  && pwsh --version
 
-ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 \
+ENV DOTNET_ROOT=/usr/share/dotnet \
+    DOTNET_CLI_TELEMETRY_OPTOUT=1 \
     DOTNET_NOLOGO=1 \
     DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
 
