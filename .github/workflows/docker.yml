@@ -28,7 +28,7 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: makecore-max
     # The image carries a kernel, two runners, a Docker daemon and the
     # toolchains, and it is built for two architectures.
     timeout-minutes: 180
@@ -75,13 +75,15 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64 #,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # A scheduled rebuild exists to take upstream updates. Reading the
-          # cache would return the same layers and publish the same packages
-          # under a new tag.
+          # No registry or GHA cache. Exporting the layers of an image this
+          # size costs more than rebuilding them, and the node already keeps
+          # BuildKit's own cache on the disk it commits after a job.
+          #
+          # A scheduled rebuild exists to take upstream updates. Reading that
+          # local cache would return the same layers and publish the same
+          # packages under a new tag.
           no-cache: ${{ github.event_name == 'schedule' || inputs.no_cache == true }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
