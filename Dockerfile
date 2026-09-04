@@ -301,6 +301,13 @@ RUN apt-get update \
 # Into every cached Node, not only the default. `setup-node` puts the version a
 # workflow pins at the front of PATH, so a global installed against 22 alone is
 # not on PATH for a job that asked for 24.
+#
+# And symlinked into /usr/local/bin, because a job that never calls setup-node
+# has no tool cache bin directory on PATH at all -- only the node, npm and npx
+# symlinks made above. A global installed into the tool cache and nowhere else
+# is then invisible, which is the 127 this was meant to prevent. The shebang of
+# each of these is `env node`, so a job that does call setup-node still runs
+# them under the Node it pinned.
 RUN for prefix in /opt/hostedtoolcache/node/*/*/ ; do \
         [ -x "${prefix}bin/npm" ] || continue ; \
         echo "global modules into ${prefix}" ; \
@@ -308,7 +315,13 @@ RUN for prefix in /opt/hostedtoolcache/node/*/*/ ; do \
             node-gyp grunt gulp n parcel typescript newman \
             webpack webpack-cli lerna yarn ; \
         chown -R runner:runner "${prefix}lib/node_modules" "${prefix}bin" ; \
-    done
+    done \
+ && for bin in /opt/hostedtoolcache/node/${NODE_LTS_A}/*/bin/* ; do \
+        name="$(basename "${bin}")" ; \
+        case "${name}" in node|npm|npx) continue ;; esac ; \
+        ln -sf "${bin}" "/usr/local/bin/${name}" ; \
+    done \
+ && node-gyp --version
 
 # Python, in the tool cache layout `setup-python` reads.
 #
