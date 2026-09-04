@@ -746,6 +746,30 @@ RUN printf '%s\n' \
         > /etc/profile.d/makecore-toolchains.sh \
  && chmod 0644 /etc/profile.d/makecore-toolchains.sh
 
+# HOME, which the unit that runs the job would otherwise not have.
+#
+# `runnerd` writes /etc/systemd/system/makecore-runner.service into the root
+# disk, and systemd starts a service with a clean environment. It fills in HOME
+# from the passwd entry of `User=`, and that unit has none: a machine that runs
+# one job has nobody to drop privileges to, so the runner runs as root. HOME is
+# therefore unset, the runner inherits that, and so does every `run:` step of
+# every job. A step under `set -u` dies on its first `$HOME` with "unbound
+# variable", and anything that resolves a path from HOME fails the same way —
+# setup-bun installs into $HOME/.bun, npm, pip and docker all keep their config
+# there. A hosted runner has none of these problems because HOME is set.
+#
+# A drop-in and not an edit to the unit, because the unit belongs to runnerd.
+# systemd merges the two whichever order they are written in.
+#
+# /home/runner is both what a GitHub-hosted runner uses and where the runner
+# already lives, so a cache written there lands on the cache disk.
+RUN install -d /etc/systemd/system/makecore-runner.service.d \
+ && printf '%s\n' \
+        '[Service]' \
+        'Environment=HOME=/home/runner' \
+        > /etc/systemd/system/makecore-runner.service.d/10-home.conf \
+ && chmod 0644 /etc/systemd/system/makecore-runner.service.d/10-home.conf
+
 # What a machine must not start on its own.
 #
 # The node writes one unit into the root disk when it builds it, and that unit

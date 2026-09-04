@@ -47,6 +47,12 @@ the cache disk is mounted over `/var/lib/docker`. Started at boot instead, the
 daemon would make an image store on the root disk, and every job would run cold
 while its cache sat unused.
 
+That unit runs as root, and systemd only fills in `HOME` from the passwd entry
+of a `User=` it does not have. This image ships a drop-in for it setting
+`HOME=/home/runner`, because the runner inherits that environment and so does
+every `run:` step of every job — without it a step under `set -u` dies on its
+first `$HOME`, and `setup-bun`, npm and pip write their caches nowhere.
+
 ## Building
 
 Pushes to `main` publish `latest`. Published releases also get semver tags. Both
