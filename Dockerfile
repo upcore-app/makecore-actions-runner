@@ -725,13 +725,32 @@ RUN if [ "${TARGETARCH}" = "amd64" ]; then \
 # GitHub's image has these present and their units inactive, and a job starts
 # whichever it wants. Masked is wrong here: a masked unit cannot be started at
 # all, which is the opposite of what a workflow expects.
+#
+# postgresql.service is not what runs Postgres. It is a oneshot /bin/true meta
+# unit, and the cluster is postgresql@18-main.service, started through
+# pg_ctlcluster. Whether that happens on boot is Debian's own switch and not
+# systemd's: start.conf next to the cluster's postgresql.conf holds `auto`,
+# `manual` or `disabled`, and `auto` is what the package ships. Disabling the
+# meta unit leaves that alone, so the cluster comes up with the machine and
+# binds 5432 — and then a job's `postgres` service container cannot publish
+# 5432 of its own, because Docker asks for 0.0.0.0:5432 and the cluster is
+# already on 127.0.0.1:5432:
+#
+#   failed to bind host port 0.0.0.0:5432/tcp: address already in use
+#
+# `manual` and not `disabled`: a job that wants Postgres on the machine can
+# still start it, which is the same bargain as disabling rather than masking.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         postgresql-18 postgresql-client-18 \
         mysql-server mysql-client \
         nginx apache2 \
  && rm -rf /var/lib/apt/lists/* \
- && systemctl disable postgresql mysql nginx apache2
+ && systemctl disable postgresql mysql nginx apache2 \
+ && for f in /etc/postgresql/*/main/start.conf; do \
+        [ -f "$f" ] && sed -i 's/^auto$/manual/' "$f" ; \
+    done ; \
+    grep -h '^manual$' /etc/postgresql/*/main/start.conf
 
 # What every job's shell has to see.
 #
